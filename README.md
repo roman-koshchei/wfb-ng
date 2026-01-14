@@ -7,7 +7,7 @@ sudo apt install -y build-essential git \
     python3-all python3-all-dev python3-twisted \
     python3-pyroute2 python3-msgpack python3-serial \
     python3-setuptools python3-virtualenv \
-    libgstrtspserver-1.0-dev catch2 debhelper
+    libgstrtspserver-1.0-dev catch2 debhelper dh-python
 ```
 
 Clone and enter repo:
