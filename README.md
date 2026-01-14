@@ -7,7 +7,8 @@ sudo apt install -y build-essential git \
     python3-all python3-all-dev python3-twisted \
     python3-pyroute2 python3-msgpack python3-serial \
     python3-setuptools python3-virtualenv \
-    libgstrtspserver-1.0-dev catch2 debhelper dh-python
+    libgstrtspserver-1.0-dev catch2 \
+    debhelper dh-python fakeroot
 ```
 
 Clone and enter repo:
@@ -23,6 +24,11 @@ sudo make deb
 Install debian package:
 ```bash
 sudo apt install ./deb_dist/*.deb
+```
+
+Check that package is installed:
+```bash
+dpkg -l | grep wfb-ng
 ```
 
 ## Original README 
