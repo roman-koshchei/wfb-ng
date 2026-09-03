@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# Copyright (C) 2018-2024 Vasily Evseenko <svpcom@p2ptech.org>
+# Copyright (C) 2018-2026 Vasily Evseenko <svpcom@p2ptech.org>
 
 #
 #   This program is free software; you can redistribute it and/or modify
@@ -29,7 +29,7 @@ import argparse
 import yaml
 
 from twisted.python import log, failure
-from twisted.internet import reactor, defer
+from twisted.internet import reactor, defer, utils
 
 from . import _log_msg, ConsoleObserver, ErrorSafeLogFile, call_and_check_rc, ExecError, version_msg, LogLevel, set_log_level
 from .common import abort_on_crash, exit_status, df_sleep, search_attr
@@ -86,7 +86,11 @@ def gen_bind_yaml(profiles):
 
 @defer.inlineCallbacks
 def init_wlans(max_bw, wlans):
-    ht_mode = bandwidth_map[max_bw]
+    try:
+        ht_mode = bandwidth_map[max_bw]
+    except KeyError:
+        raise Exception('Unsupported bandwidth %r, expected one of: %s' % (
+            max_bw, ', '.join(str(b) for b in sorted(bandwidth_map))))
 
     if not settings.common.primary:
         log.msg('Skip card init due to secondary role')
@@ -103,18 +107,25 @@ def init_wlans(max_bw, wlans):
             log.msg('Interface %s has driver %s' % (wlan, driver))
 
             if settings.common.set_nm_unmanaged and os.path.exists('/usr/bin/nmcli'):
-                device_status = yield call_and_check_rc('nmcli', 'device', 'show', wlan, log_stdout=False)
-                if not b'(unmanaged)' in device_status:
+                # rc != 0: NetworkManager not running or unaware of the device
+                stdout, stderr, rc = yield utils.getProcessOutputAndValue('nmcli', ('-t', '-f', 'GENERAL.STATE', 'device', 'show', wlan), env=os.environ)
+                if rc != 0:
+                    log.msg('nmcli: %s' % (stderr.decode(errors='ignore').strip(),))
+                elif b'unmanaged' not in stdout:
                     log.msg('Switch %s to unmanaged state' % (wlan,))
                     yield call_and_check_rc('nmcli', 'device', 'set', wlan, 'managed', 'no')
                     yield df_sleep(1)
 
-            yield call_and_check_rc('ip', 'link', 'set', wlan, 'down')
-            yield call_and_check_rc('iw', 'dev', wlan, 'set', 'monitor', 'otherbss')
-            yield call_and_check_rc('ip', 'link', 'set', wlan, 'up')
+            monitor_mode_satus = yield call_and_check_rc('iw', 'dev', wlan, 'info', log_stdout=False)
+            if not b'type monitor' in monitor_mode_satus:
+                yield call_and_check_rc('ip', 'link', 'set', wlan, 'down')
+                yield call_and_check_rc('iw', 'dev', wlan, 'set', 'monitor', 'otherbss')
+                yield call_and_check_rc('ip', 'link', 'set', wlan, 'up')
 
             # You can set own frequency channel for each card
             if isinstance(settings.common.wifi_channel, dict):
+                if wlan not in settings.common.wifi_channel:
+                    raise Exception("wifi_channel has no entry for interface '%s'" % (wlan,))
                 channel = settings.common.wifi_channel[wlan]
             else:
                 channel = settings.common.wifi_channel
@@ -129,6 +140,8 @@ def init_wlans(max_bw, wlans):
 
             # You can set own tx power for each card
             if isinstance(txpower, dict):
+                if wlan not in txpower:
+                    raise Exception("wifi_txpower has no entry for interface '%s'" % (wlan,))
                 txpower = txpower[wlan]
 
             if txpower not in (None, 'off'):
@@ -167,7 +180,7 @@ def init(profiles, wlans, cluster_mode):
                                   settings.common.__dict__)
 
             for idx, wlan in enumerate(settings.cluster.nodes[node]['wlans']):
-                if (txpower[wlan] if isinstance(txpower, dict) else txpower) == 'off':
+                if (txpower.get(wlan) if isinstance(txpower, dict) else txpower) == 'off':
                     rx_only_wlan_ids.add((node_ipv4_addr << 24) | idx)
 
 
@@ -200,13 +213,16 @@ def init(profiles, wlans, cluster_mode):
         if not wlans:
             raise Exception('WiFi interface list is empty!')
 
-        max_bw = max(cfg.bandwidth for _, tmp in services for _, _, cfg in tmp)
+        bw_list = [cfg.bandwidth for _, tmp in services for _, _, cfg in tmp]
+        if not bw_list:
+            raise Exception('No services configured for profile(s): %s' % (', '.join(profiles),))
+        max_bw = max(bw_list)
         yield init_wlans(max_bw, wlans)
 
         txpower = settings.common.wifi_txpower
 
         for idx, wlan in enumerate(wlans):
-            if (txpower[wlan] if isinstance(txpower, dict) else txpower) == 'off':
+            if (txpower.get(wlan) if isinstance(txpower, dict) else txpower) == 'off':
                 rx_only_wlan_ids.add(idx)
 
 
@@ -258,7 +274,7 @@ def init(profiles, wlans, cluster_mode):
         link_id = hash_link_domain(profile_cfg.link_domain)
 
         if profile_cfg.stats_port:
-            p_f = MsgPackAPIFactory(ant_sel_f.ui_sessions, is_cluster, cli_title)
+            p_f = MsgPackAPIFactory(ant_sel_f.ui_sessions, is_cluster, cli_title, profile)
             sockets.append(reactor.listenTCP(profile_cfg.stats_port, p_f))
 
         if profile_cfg.api_port:

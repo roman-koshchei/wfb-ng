@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# Copyright (C) 2018-2024 Vasily Evseenko <svpcom@p2ptech.org>
+# Copyright (C) 2018-2026 Vasily Evseenko <svpcom@p2ptech.org>
 
 #
 #   This program is free software; you can redistribute it and/or modify
@@ -54,6 +54,16 @@ class Section(object):
 
     def __deepcopy__(self, memo):
         return copy.deepcopy(self.__dict__, memo)
+
+
+def settings_from_dict(data):
+    # Reverse of __deepcopy__: rebuild Settings from settings pushed by a remote server
+    settings = Settings()
+    for section_name, section_dict in data.items():
+        section = Section()
+        section.__dict__.update(section_dict)
+        setattr(settings, section_name, section)
+    return settings
 
 
 def parse_config(basedir, cfg_patterns, interpolate=True):

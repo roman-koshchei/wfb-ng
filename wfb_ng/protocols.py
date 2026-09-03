@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Copyright (C) 2018-2024 Vasily Evseenko <svpcom@p2ptech.org>
+# Copyright (C) 2018-2026 Vasily Evseenko <svpcom@p2ptech.org>
 
 #
 #   This program is free software; you can redistribute it and/or modify
@@ -22,11 +22,13 @@ import msgpack
 import os
 import time
 import json
+import math
 
 from itertools import groupby
 from copy import deepcopy
+from zope.interface import implementer
 from twisted.python import log, failure
-from twisted.internet import reactor, defer, threads, task
+from twisted.internet import reactor, defer, threads, task, interfaces
 from twisted.internet.protocol import ProcessProtocol, Factory, ConnectedDatagramProtocol
 from twisted.protocols.basic import LineReceiver, Int32StringReceiver
 
@@ -44,6 +46,59 @@ class WFBFlags(object):
 
 fec_types = {1: 'VDM_RS'}
 
+
+# RSSI and SNR are logarithmic values, so they shall be averaged in the linear scale
+
+def db_to_linear(db):
+    return 10.0 ** (db / 10.0)
+
+
+def linear_to_db(linear):
+    return int(round(10.0 * math.log10(linear))) if linear > 0 else -128
+
+
+def group_by_freq_and_rxid(ant_stats_by_rx):
+    stats_agg = {}
+    freqs = set()
+    mbw = set()
+
+    for ant_stats in ant_stats_by_rx.values():
+        for (((freq, mcs_index, bandwidth), ant_id),
+             (pkt_s,
+              rssi_min, rssi_avg, rssi_max,
+              snr_min, snr_avg, snr_max)) in ant_stats.items():
+
+            freqs.add(freq)
+            mbw.add((mcs_index, bandwidth))
+
+            rssi_sum = db_to_linear(rssi_avg) * pkt_s
+            snr_sum = db_to_linear(snr_avg) * pkt_s
+
+            if ant_id not in stats_agg:
+                stats_agg[ant_id] = (pkt_s,
+                                     rssi_min, rssi_sum, rssi_max,
+                                     snr_min, snr_sum, snr_max)
+            else:
+                tmp = stats_agg[ant_id]
+                stats_agg[ant_id] = (pkt_s + tmp[0],
+                                    min(rssi_min, tmp[1]),
+                                    rssi_sum + tmp[2],
+                                    max(rssi_max, tmp[3]),
+                                    min(snr_min, tmp[4]),
+                                    snr_sum + tmp[5],
+                                    max(snr_max, tmp[6]))
+
+    ant_stat = dict((ant_id, (pkt_s,
+                              rssi_min, linear_to_db(rssi_sum / pkt_s), rssi_max,
+                              snr_min, linear_to_db(snr_sum / pkt_s), snr_max)) \
+                    for ant_id, (pkt_s,
+                                 rssi_min, rssi_sum, rssi_max,
+                                 snr_min, snr_sum, snr_max) in stats_agg.items())
+
+    return ant_stat, freqs, mbw
+
+
+@implementer(interfaces.IPushProducer)
 class StatisticsMsgPackProtocol(Int32StringReceiver):
     def connectionMade(self):
         # Push all config values for CLI into session
@@ -54,10 +109,16 @@ class StatisticsMsgPackProtocol(Int32StringReceiver):
                                            cli_title=self.factory.cli_title or "",
                                            is_cluster=self.factory.is_cluster,
                                            log_interval=settings.common.log_interval,
-                                           temp_overheat_warning=settings.common.temp_overheat_warning),
+                                           temp_overheat_warning=settings.common.temp_overheat_warning,
+                                           profile=self.factory.profile,
+                                           settings=deepcopy(settings)),
                                       use_bin_type=True))
 
         self.factory.ui_sessions.append(self)
+
+        # setup push producer
+        self.paused = False
+        self.transport.registerProducer(self, True)
 
     def stringReceived(self, string):
         pass
@@ -65,10 +126,26 @@ class StatisticsMsgPackProtocol(Int32StringReceiver):
     def connectionLost(self, reason):
         self.factory.ui_sessions.remove(self)
 
+        if reactor.running:
+            self.transport.unregisterProducer()
+
+    def pauseProducing(self):
+        self.paused = True
+        log.msg('Pause msgpack stat stream to %r' % (self.transport.getPeer(),))
+
+    def resumeProducing(self):
+        self.paused = False
+        log.msg('Resume msgpack stat stream to %r' % (self.transport.getPeer(),))
+
+    def stopProducing(self):
+        self.paused = True
+
     def send_stats(self, data):
-        self.sendString(msgpack.packb(data, use_bin_type=True))
+        if not self.paused:
+            self.sendString(msgpack.packb(data, use_bin_type=True))
 
 
+@implementer(interfaces.IPushProducer)
 class StatisticsJSONProtocol(LineReceiver):
     delimiter = b'\n'
 
@@ -83,13 +160,34 @@ class StatisticsJSONProtocol(LineReceiver):
         self.sendLine(msg.encode('utf-8'))
         self.factory.ui_sessions.append(self)
 
+        # setup push producer
+        self.paused = False
+        self.transport.registerProducer(self, True)
+
     def lineReceived(self, line):
         pass
 
     def connectionLost(self, reason):
         self.factory.ui_sessions.remove(self)
 
+        if reactor.running:
+            self.transport.unregisterProducer()
+
+    def pauseProducing(self):
+        self.paused = True
+        log.msg('Pause json stat stream to %r' % (self.transport.getPeer(),))
+
+    def resumeProducing(self):
+        self.paused = False
+        log.msg('Resume json stat stream to %r' % (self.transport.getPeer(),))
+
+    def stopProducing(self):
+        self.paused = True
+
     def send_stats(self, data):
+        if self.paused:
+            return
+
         data = dict(data)
 
         if data['type'] == 'rx':
@@ -122,26 +220,30 @@ class RFTempMeter(object):
     def read_temperature(self):
         def _read_temperature():
             res = {}
+            driver_names = ('rtl88x2eu', 'rtl88x2cu')
             for idx, wlan in enumerate(self.wlans):
-                fname = '/proc/net/rtl88x2eu/%s/thermal_state' % (wlan,)
-                try:
-                    with open(fname) as fd:
-                        for line in fd:
-                            line = line.strip()
-                            if not line:
-                                continue
+                for driver in driver_names:
+                    fname = '/proc/net/%s/%s/thermal_state' % (driver, wlan)
+                    try:
+                        with open(fname) as fd:
+                            for line in fd:
+                                line = line.strip()
+                                if not line:
+                                    continue
 
-                            d = {}
-                            for f in line.split(','):
-                                k, v = f.split(':', 1)
-                                d[k.strip()] = int(v.strip())
+                                d = {}
+                                for f in line.split(','):
+                                    k, v = f.split(':', 1)
+                                    d[k.strip()] = int(v.strip())
 
-                            ant_id = (idx << 8) + d['rf_path']
-                            res[ant_id] = d['temperature']
-                except FileNotFoundError:
-                    pass
-                except Exception as v:
-                    reactor.callFromThread(log.err, v, 'Unable to parse %s:' % (fname,))
+                                ant_id = (idx << 8) + d['rf_path']
+                                res[ant_id] = d['temperature']
+                                break
+                    except FileNotFoundError:
+                        continue
+                    except Exception as v:
+                        reactor.callFromThread(log.err, v, 'Unable to parse %s:' % (fname,))
+                        break
             return res
 
         def _got_temp(temp_d):
@@ -155,10 +257,11 @@ class MsgPackAPIFactory(Factory):
     noisy = False
     protocol = StatisticsMsgPackProtocol
 
-    def __init__(self, ui_sessions, is_cluster=False, cli_title=None):
+    def __init__(self, ui_sessions, is_cluster=False, cli_title=None, profile=None):
         self.ui_sessions = ui_sessions
         self.is_cluster = is_cluster
         self.cli_title = cli_title
+        self.profile = profile
 
 
 class JSONAPIFactory(Factory):
@@ -211,36 +314,6 @@ class AntStatsAndSelector(object):
 
     def add_rssi_cb(self, rssi_cb):
         self.rssi_cb_l.append(rssi_cb)
-
-    def _stats_agg_by_freq_and_rxid(self, ant_stats_by_rx):
-        stats_agg = {}
-
-        for ant_stats in ant_stats_by_rx.values():
-            for (((freq, mcs_index, bandwidth), ant_id),
-                 (pkt_s,
-                  rssi_min, rssi_avg, rssi_max,
-                  snr_min, snr_avg, snr_max)) in ant_stats.items():
-
-                if ant_id not in stats_agg:
-                    stats_agg[ant_id] = (pkt_s,
-                                         rssi_min, rssi_avg * pkt_s, rssi_max,
-                                         snr_min, snr_avg * pkt_s, snr_max)
-                else:
-                    tmp = stats_agg[ant_id]
-                    stats_agg[ant_id] = (pkt_s + tmp[0],
-                                        min(rssi_min, tmp[1]),
-                                        rssi_avg * pkt_s + tmp[2],
-                                        max(rssi_max, tmp[3]),
-                                        min(snr_min, tmp[4]),
-                                        snr_avg * pkt_s + tmp[5],
-                                        max(snr_max, tmp[6]))
-
-        return dict((ant_id, (pkt_s,
-                              rssi_min, rssi_avg // pkt_s, rssi_max,
-                              snr_min, snr_avg // pkt_s, snr_max)) \
-                    for ant_id, (pkt_s,
-                                 rssi_min, rssi_avg, rssi_max,
-                                 snr_min, snr_avg, snr_max) in stats_agg.items())
 
     def select_tx_antenna(self, stats_agg):
         wlan_rssi_and_pkts = {}
@@ -308,7 +381,8 @@ class AntStatsAndSelector(object):
         ant_stats_by_rx = dict((rx_id, ant_stats) for rx_id, (ant_stats, packet_stats) in cur_stats.items())
         packet_stats_by_rx = dict((rx_id, packet_stats) for rx_id, (ant_stats, packet_stats) in cur_stats.items())
 
-        stats_agg = self._stats_agg_by_freq_and_rxid(ant_stats_by_rx)
+        stats_agg = group_by_freq_and_rxid(ant_stats_by_rx)[0]
+
         # (rssi,noise) tuples
         card_rssi_l = list((rssi_avg, rssi_avg - snr_avg)
                            for pkt_s,
@@ -411,7 +485,9 @@ class RXAntennaProtocol(LineReceiver):
 
                 k_tuple = ('all', 'all_bytes', 'dec_err', 'session', 'data', 'uniq', 'fec_rec', 'lost', 'bad', 'out', 'out_bytes')
                 counters = tuple(int(i) for i in cols[2].split(':'))
-                assert len(counters) == len(k_tuple)
+
+                if len(counters) != len(k_tuple):
+                    raise BadTelemetry()
 
                 if not self.count_all:
                     self.count_all = counters
@@ -438,7 +514,7 @@ class RXAntennaProtocol(LineReceiver):
                     self.ant_stat_cb.process_new_session(self.rx_id, self.session)
             else:
                 raise BadTelemetry()
-        except BadTelemetry:
+        except (BadTelemetry, ValueError):
             log.msg('Bad telemetry [%s]: %s' % (self.rx_id, line), isError=1)
 
 
@@ -472,57 +548,63 @@ class TXAntennaProtocol(LineReceiver):
         self.count_all = None
 
     def lineReceived(self, line):
-        cols = line.decode('utf-8').strip().split('\t')
+        line = line.decode('utf-8').strip()
+        cols = line.split('\t')
         if len(cols) < 2:
             return
 
-        #ts = int(cols[0])
-        cmd = cols[1]
+        try:
+            #ts = int(cols[0])
+            cmd = cols[1]
 
-        if cmd == 'LISTEN_UDP' and len(cols) == 3:
-            port, wlan_id = cols[2].split(':', 1)
-            self.ports[int(wlan_id, 16)] = int(port)
+            if cmd == 'LISTEN_UDP' and len(cols) == 3:
+                port, wlan_id = cols[2].split(':', 1)
+                self.ports[int(wlan_id, 16)] = int(port)
 
-        elif cmd == 'LISTEN_UDP_END' and self.ports_df is not None:
-            self.ports_df.callback(self.ports)
+            elif cmd == 'LISTEN_UDP_END' and self.ports_df is not None:
+                self.ports_df.callback(self.ports)
 
-        elif cmd == 'LISTEN_UNIX' and len(cols) == 3:
-            unix_socket, wlan_id = cols[2].split(':', 1)
-            self.sockets[int(wlan_id, 16)] = unix_socket
+            elif cmd == 'LISTEN_UNIX' and len(cols) == 3:
+                unix_socket, wlan_id = cols[2].split(':', 1)
+                self.sockets[int(wlan_id, 16)] = unix_socket
 
-        elif cmd == 'LISTEN_UNIX_END' and self.ports_df is not None:
-            self.ports_df.callback(self.sockets)
+            elif cmd == 'LISTEN_UNIX_END' and self.ports_df is not None:
+                self.ports_df.callback(self.sockets)
 
-        elif cmd == 'LISTEN_UDP_CONTROL' and len(cols) == 3 and self.control_port_df is not None:
-            port = cols[2]
-            self.control_port = int(port)
-            self.control_port_df.callback(self.control_port)
+            elif cmd == 'LISTEN_UDP_CONTROL' and len(cols) == 3 and self.control_port_df is not None:
+                port = cols[2]
+                self.control_port = int(port)
+                self.control_port_df.callback(self.control_port)
 
-        elif cmd == 'TX_ANT':
-            if len(cols) != 4:
-                raise BadTelemetry()
-            self.ant[int(cols[2], 16)] = tuple(int(i) for i in cols[3].split(':'))
+            elif cmd == 'TX_ANT':
+                if len(cols) != 4:
+                    raise BadTelemetry()
+                self.ant[int(cols[2], 16)] = tuple(int(i) for i in cols[3].split(':'))
 
-        elif cmd == 'PKT':
-            if len(cols) != 3:
-                raise BadTelemetry()
+            elif cmd == 'PKT':
+                if len(cols) != 3:
+                    raise BadTelemetry()
 
-            k_tuple = ('fec_timeouts', 'incoming', 'incoming_bytes', 'injected', 'injected_bytes', 'dropped', 'truncated')
-            counters = tuple(int(i) for i in cols[2].split(':'))
-            assert len(counters) == len(k_tuple)
+                k_tuple = ('fec_timeouts', 'incoming', 'incoming_bytes', 'injected', 'injected_bytes', 'dropped', 'truncated')
+                counters = tuple(int(i) for i in cols[2].split(':'))
 
-            if not self.count_all:
-                self.count_all = counters
-            else:
-                self.count_all = tuple((a + b) for a, b in zip(counters, self.count_all))
+                if len(counters) != len(k_tuple):
+                    raise BadTelemetry()
 
-            stats = dict(zip(k_tuple, zip(counters, self.count_all)))
+                if not self.count_all:
+                    self.count_all = counters
+                else:
+                    self.count_all = tuple((a + b) for a, b in zip(counters, self.count_all))
 
-            # Send stats to aggregators
-            if self.ant_stat_cb is not None:
-                self.ant_stat_cb.update_tx_stats(self.tx_id, stats, dict(self.ant))
+                stats = dict(zip(k_tuple, zip(counters, self.count_all)))
 
-            self.ant.clear()
+                # Send stats to aggregators
+                if self.ant_stat_cb is not None:
+                    self.ant_stat_cb.update_tx_stats(self.tx_id, stats, dict(self.ant))
+
+                self.ant.clear()
+        except (BadTelemetry, ValueError):
+            log.msg('Bad telemetry [%s]: %s' % (self.tx_id, line), isError=1)
 
 
 class RXProtocol(ProcessProtocol):

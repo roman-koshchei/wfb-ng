@@ -1,5 +1,5 @@
 #pragma once
-// Copyright (C) 2017 - 2024 Vasily Evseenko <svpcom@p2ptech.org>
+// Copyright (C) 2017 - 2026 Vasily Evseenko <svpcom@p2ptech.org>
 
 /*
  *   This program is free software; you can redistribute it and/or modify
@@ -189,6 +189,9 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
 #define WFB_PACKET_DATA    0x1
 #define WFB_PACKET_SESSION 0x2
 
+// Service packet type for forwarder -> aggregator UDP channel. Never goes over the air
+#define WFB_PACKET_DEDUP_STATS 0x3
+
 // FEC types
 #define WFB_FEC_VDM_RS  0x1  //Reed-Solomon on Vandermonde matrix
 
@@ -208,6 +211,13 @@ typedef struct {
     uint8_t mcs_index;
     uint8_t bandwidth;
 } __attribute__ ((packed)) wrxfwd_t;
+
+// Stats record for a data packet deduplicated by forwarder. Array of such records
+// is sent to aggregator as WFB_PACKET_DEDUP_STATS packet with wlan_idx = 0xff.
+typedef struct {
+    uint8_t pkt_hash[8]; // truncated hash of raw packet contents
+    wrxfwd_t rx_info;
+} __attribute__ ((packed)) wrxfwd_dedup_t;
 
 // Network packet headers. All numbers are in network (big endian) format
 // Encrypted packets can be either session key or data packet.

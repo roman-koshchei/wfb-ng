@@ -1,7 +1,7 @@
 #pragma once
 // -*- C++ -*-
 //
-// Copyright (C) 2017 - 2024 Vasily Evseenko <svpcom@p2ptech.org>
+// Copyright (C) 2017 - 2026 Vasily Evseenko <svpcom@p2ptech.org>
 
 /*
  *   This program is free software; you can redistribute it and/or modify
@@ -19,6 +19,7 @@
  */
 
 #include <unordered_map>
+#include <unordered_set>
 #include <stdint.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -30,6 +31,9 @@
 #include <set>
 #include <string.h>
 #include <stdexcept>
+#include <algorithm>
+#include <limits.h>
+#include <math.h>
 
 #include "wifibroadcast.hpp"
 #include "zfex.h"
@@ -39,7 +43,7 @@ class PacketLossListener
 {
 public:
     virtual ~PacketLossListener() = default;
-    virtual void on_packet_loss(uint32_t lost_count, uint32_t last_seq, uint32_t new_seq) = 0;
+    virtual void on_packet_loss(uint32_t lost_count, uint64_t last_seq, uint64_t new_seq) = 0;
 };
 
 typedef enum {
@@ -57,8 +61,68 @@ public:
                                 uint8_t bandwidth, sockaddr_in *sockaddr) = 0;
 
     virtual void dump_stats(void) = 0;
+
+    // Deadline of internally buffered data that must be sent
+    // even if no new packets arrive. UINT64_MAX if nothing is buffered.
+    virtual uint64_t get_flush_ts(void) { return UINT64_MAX; }
+    virtual void flush(void) {}
 };
 
+
+// Rotation interval of packet hash dedup sets.
+// Effective hash retention time is 1..2 intervals.
+#define FWD_ROTATE_MS 100
+#define AGG_ROTATE_MS 1000
+
+// Aggregation delay of dedup stats records in forwarder mode
+#define FWD_DEDUP_BATCH_MS 100
+
+// Set of recently seen packet hashes. Instead of storing timestamp for each entry
+// it keeps two hash sets and clears them in turn every rotate_ms,
+// so lookup and insert have O(1) amortized cost.
+class SeenPacketsSet
+{
+public:
+    SeenPacketsSet(uint64_t rotate_ms) : clear_idx(0), rotate_ms(rotate_ms), clear_ts(get_time_ms() + rotate_ms)
+    {
+    }
+
+    bool contains(uint64_t pkt_hash)
+    {
+        expire();
+        return hashes[0].count(pkt_hash) > 0 || hashes[1].count(pkt_hash) > 0;
+    }
+
+    void insert(uint64_t pkt_hash)
+    {
+        expire();
+        hashes[0].insert(pkt_hash);
+        hashes[1].insert(pkt_hash);
+    }
+
+private:
+    void expire(void)
+    {
+        uint64_t cur_ts = get_time_ms();
+
+        if (cur_ts < clear_ts) return;
+
+        if (cur_ts >= clear_ts + rotate_ms)
+        {
+            // More than one rotation was missed - clear both sets
+            hashes[clear_idx ^ 1].clear();
+        }
+
+        hashes[clear_idx].clear();
+        clear_idx ^= 1;
+        clear_ts = cur_ts + rotate_ms;
+    }
+
+    std::unordered_set<uint64_t> hashes[2];
+    int clear_idx;
+    const uint64_t rotate_ms;
+    uint64_t clear_ts;
+};
 
 class Forwarder : public BaseAggregator
 {
@@ -68,10 +132,18 @@ public:
     virtual void process_packet(const uint8_t *buf, size_t size, uint8_t wlan_idx, const uint8_t *antenna,
                                 const int8_t *rssi, const int8_t *noise, uint16_t freq, uint8_t mcs_index,
                                 uint8_t bandwidth,sockaddr_in *sockaddr);
-    virtual void dump_stats(void) {}
+    virtual void dump_stats(void);
+    virtual uint64_t get_flush_ts(void);
+    virtual void flush(void);
 private:
+    void flush_dedup_batch(void);
+
     int sockfd;
     struct sockaddr_in saddr;
+    SeenPacketsSet seen_packets;
+    uint64_t dedup_batch_flush_ts;
+    size_t dedup_batch_size;
+    uint8_t dedup_batch[MAX_FORWARDER_PACKET_SIZE];
 };
 
 
@@ -89,6 +161,33 @@ typedef struct {
 static inline int modN(int x, int base)
 {
     return (base + (x % base)) % base;
+}
+
+// RSSI and SNR are logarithmic values, so they shall be averaged in the linear scale.
+// Use lookup table to avoid pow() call for every received packet.
+static inline double db_to_linear(int8_t db)
+{
+    static const struct db_lut_t
+    {
+        double v[256];
+        db_lut_t(void)
+        {
+            for(int i = 0; i < 256; i++)
+            {
+                v[i] = pow(10.0, (int8_t)i / 10.0);
+            }
+        }
+    } lut;
+
+    return lut.v[(uint8_t)db];
+}
+
+static inline int8_t linear_to_db(double linear)
+{
+    if (linear <= 0) return SCHAR_MIN;
+
+    long db = lround(10.0 * log10(linear));
+    return (int8_t)std::min(std::max(db, (long)SCHAR_MIN), (long)SCHAR_MAX);
 }
 
 class rxAntennaItem
@@ -112,16 +211,26 @@ public:
             snr_min = std::min(snr, snr_min);
             snr_max = std::max(snr, snr_max);
         }
-        rssi_sum += rssi;
-        snr_sum += snr;
+        rssi_sum += db_to_linear(rssi);
+        snr_sum += db_to_linear(snr);
         count_all += 1;
     }
 
+    int8_t rssi_avg(void) const
+    {
+        return count_all > 0 ? linear_to_db(rssi_sum / count_all) : 0;
+    }
+
+    int8_t snr_avg(void) const
+    {
+        return count_all > 0 ? linear_to_db(snr_sum / count_all) : 0;
+    }
+
     int32_t count_all;
-    int32_t rssi_sum;
+    double rssi_sum;  // sum of rssi in linear scale
     int8_t rssi_min;
     int8_t rssi_max;
-    int32_t snr_sum;
+    double snr_sum;   // sum of snr in linear scale
     int8_t snr_min;
     int8_t snr_max;
 };
@@ -203,7 +312,7 @@ public:
     uint32_t count_p_dec_err;
     uint32_t count_p_session;
     uint32_t count_p_data;
-    std::set<uint64_t> count_p_uniq;
+    std::set<uint64_t> count_p_uniq; // hashes of unique data packets
     uint32_t count_p_fec_recovered;
     uint32_t count_p_lost;
     uint32_t count_p_bad;
@@ -234,7 +343,7 @@ private:
     int fec_n;  // RS total number of fragments in block
     uint8_t session_hash[crypto_generichash_BYTES];
 
-    uint32_t seq;
+    uint64_t seq;
     rx_ring_item_t rx_ring[RX_RING_SIZE];
     int rx_ring_front; // current packet
     int rx_ring_alloc; // number of allocated entries
@@ -246,6 +355,9 @@ private:
     uint8_t rx_secretkey[crypto_box_SECRETKEYBYTES];
     uint8_t tx_publickey[crypto_box_PUBLICKEYBYTES];
     uint8_t session_key[crypto_aead_chacha20poly1305_KEYBYTES];
+
+    // Hashes of successfully decrypted packets to validate forwarder dedup stats
+    SeenPacketsSet decrypted_packets;
 
     // Packet loss listener for immediate notifications
     PacketLossListener* packet_loss_listener_ = nullptr;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# Copyright (C) 2018-2024 Vasily Evseenko <svpcom@p2ptech.org>
+# Copyright (C) 2018-2026 Vasily Evseenko <svpcom@p2ptech.org>
 
 #
 #   This program is free software; you can redistribute it and/or modify
@@ -183,7 +183,11 @@ class MavlinkUDPProxyProtocol(DatagramProtocol, MavlinkProxyProtocol):
 
         # Send non-aggregated packets directly
         if self.agg_max_size is None or not self.agg_timeout:
-            self.transport.write(msg, self.reply_addr)
+            try:
+                self.transport.write(msg, self.reply_addr)
+            except OSError as v:
+                if v.errno not in (ENETUNREACH, EHOSTUNREACH):
+                    raise
             return
 
         # Split batch of mavlink packets due to issues with mavlink-router

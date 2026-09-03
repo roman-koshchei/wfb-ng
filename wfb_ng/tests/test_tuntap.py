@@ -1,6 +1,23 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
+# Copyright (C) 2019-2026 Vasily Evseenko <svpcom@p2ptech.org>
+
+#
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; version 3.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License along
+#   with this program; if not, write to the Free Software Foundation, Inc.,
+#   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+
 import os
 import time
 from twisted import version as twisted_version
@@ -30,13 +47,16 @@ class TUNTAPTestCase(unittest.TestCase):
        or twisted_version < Version("Twisted", 19, 7, 0):
         skip = "Root requires or system is incompatible"
 
+    @defer.inlineCallbacks
     def setUp(self):
         self.p1 = TUNTAPProtocol(mtu=1400)
         self.p2 = TUNTAPProtocol(mtu=1400)
         self.p1.peer = self.p2
         self.p2.peer = self.p1
         self.ep1 = TUNTAPTransport(reactor, self.p1, 'tuntest1', '192.168.77.1/24', mtu=1400)
+        yield self.ep1.setup()
         self.ep2 = TUNTAPTransport(reactor, self.p2, 'tuntest2', '192.168.77.2/24', mtu=1400)
+        yield self.ep2.setup()
 
     def tearDown(self):
         self.ep1.loseConnection()

@@ -72,10 +72,13 @@ See https://github.com/svpcom/wfb-ng/wiki for additional info
 Telegram group: (**wfb-ng support**) https://t.me/wfb_ng
 Please note, that it is only one official group.
 
+## WFB-ng Data Transport Standard
+[RFC draft](doc/wfb-ng-std-draft.md)
+
 ## Supported WiFi hardware:
  - **RTL8812au**. (stable) 802.11ac capable. [**Requires external patched driver!**](https://github.com/svpcom/rtl8812au) System was tested with ALPHA AWUS036ACH on both sides in 5GHz mode.
  - **RTL8812eu**. (stable) 802.11ac capable. [**Requires external patched driver!**](https://github.com/svpcom/rtl8812eu) System was tested with [LB-LINK's BL-M8812EU2 module](https://www.lb-link.com/product_36_183.html)
- - **Atheros AR9350**. (beta) 802.11n (2.4GHz and/or 5GHz bands) + LDPC capable. Should work out of box, but requires kernel patches **to control TX power** (by default it will use max power). System was tested with [TP-Link CPE510](https://openwrt.org/toh/tp-link/cpe510), but should work with all similar devices.
+ - **Atheros AR9350**. (stable) 802.11n (2.4GHz and/or 5GHz bands) + LDPC capable. Work out of box, but requires kernel patches **to control TX power** (by default it will use max power). System was tested with [TP-Link CPE510](https://openwrt.org/toh/tp-link/cpe510), but should work with all similar devices on **ath9k SoC chipsets** running OpenWRT (Ubiquiti, etc).
 
 ##### NOTE:
 - For Atheros SoC you need to use [cluster mode (beta)](https://github.com/svpcom/wfb-ng/wiki/Distributed-operation) due to CPU, Flash and RAM limits.

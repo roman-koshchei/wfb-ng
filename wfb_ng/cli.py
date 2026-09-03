@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# Copyright (C) 2018-2024 Vasily Evseenko <svpcom@p2ptech.org>
+# Copyright (C) 2018-2026 Vasily Evseenko <svpcom@p2ptech.org>
 
 #
 #   This program is free software; you can redistribute it and/or modify
@@ -28,11 +28,15 @@ import struct
 import fcntl
 import argparse
 
+from itertools import groupby
 from twisted.python import log
 from twisted.internet import reactor, defer
 from twisted.internet.protocol import ReconnectingClientFactory
 from twisted.protocols.basic import Int32StringReceiver
-from .server import parse_services
+from twisted.protocols.policies import TimeoutMixin
+from .services import parse_services
+from .config_parser import settings_from_dict
+from .protocols import group_by_freq_and_rxid
 from .common import abort_on_crash, exit_status
 from .conf import settings
 from . import version_msg
@@ -138,25 +142,53 @@ def format_ant(ant_id):
         return '%08X:%X:%X' % (ant_id >> 32, (ant_id >> 8) & 0xff, ant_id & 0xff)
 
 
-class AntennaStat(Int32StringReceiver):
+class AntennaStat(Int32StringReceiver, TimeoutMixin):
     MAX_LENGTH = 1024 * 1024
     is_cluster = False
     log_interval = settings.common.log_interval
     temp_overheat_warning = settings.common.temp_overheat_warning
+    all_freqs = None
+
+    def __init__(self):
+        self.all_freqs = set()
+
+    def stats_timeout(self):
+        # rx/tx stats arrive every log_interval; a server restart can leave
+        # the tcp connection open but silent, hanging the cli forever
+        return max(5.0, 5.0 * self.log_interval / 1000.0)
+
+    def connectionMade(self):
+        self.setTimeout(self.stats_timeout())
+
+    def dataReceived(self, data):
+        self.resetTimeout()
+        Int32StringReceiver.dataReceived(self, data)
+
+    def timeoutConnection(self):
+        set_window_title('No data from wifibroadcast@%s.service, reconnecting...' % (self.factory.profile,))
+        self.transport.abortConnection()
+
+    def connectionLost(self, reason):
+        self.setTimeout(None)
 
     def stringReceived(self, string):
         attrs = msgpack.unpackb(string, strict_map_key=False, use_list=False, raw=False)
 
         if attrs['type'] == 'rx':
+            self.factory.status_msg = None
             self.draw_rx(attrs)
         elif attrs['type'] == 'tx':
+            self.factory.status_msg = None
             self.draw_tx(attrs)
         elif attrs['type'] == 'cli_title':
             # Fallbacks added for compatibility with old server versions
             self.is_cluster = attrs.get('is_cluster', False)
             self.log_interval = attrs.get('log_interval', settings.common.log_interval)
+            self.setTimeout(self.stats_timeout())
             self.temp_overheat_warning = attrs.get('temp_overheat_warning', settings.common.temp_overheat_warning)
             set_window_title(attrs['cli_title'])
+            defer.maybeDeferred(self.factory.update_service_list, attrs.get('settings'), attrs.get('profile'))\
+                 .addErrback(abort_on_crash)
 
     def draw_rx(self, attrs):
         p = attrs['packets']
@@ -210,15 +242,31 @@ class AntennaStat(Int32StringReceiver):
                 lpad = ''
                 rpad = ''
 
-            addstr_markup(window, 2, 20, '{Freq MCS BW %s[ANT]%s pkt/s dloss}     {RSSI} [dBm]        {SNR} [dB]' % (lpad, rpad))
-            for y, (((freq, mcs_index, bandwidth), ant_id), v) in enumerate(sorted(stats_d.items()), 3):
+            ant_stats, freqs, mbw = group_by_freq_and_rxid({rx_id: stats_d})
+            self.all_freqs.update(freqs)
+
+            freqs_lines = []
+
+            for _, grp in groupby(enumerate(sorted(self.all_freqs)), key=lambda x: x[0] // 10):
+                freqs_lines.append(' '.join('{%4d}' % (freq,) if freq in freqs else '%4d' % (freq,)
+                                            for _, freq in grp))
+
+            addstr_markup(window, 1, 20, '{M/BW:} %s' % (' '.join('%d/%d' % (mcs, bw) for mcs, bw in sorted(mbw))))
+
+            y_off = 2
+            for fl in freqs_lines:
+                addstr_markup(window, y_off, 20, '{Freq:} %s' % (fl,))
+                y_off += 1
+
+            addstr_markup(window, y_off + 1, 20, '%s[ANT]%s pkt/s dloss}     {RSSI} [dBm]        {SNR} [dB]' % (lpad, rpad))
+
+            for y, (ant_id, v) in enumerate(sorted(ant_stats.items()), y_off + 2):
                 pkt_s, rssi_min, rssi_avg, rssi_max, snr_min, snr_avg, snr_max = v
                 if y < ymax:
                     active_tx = ((ant_id >> 8) == tx_wlan)
                     diff_loss = max(p['uniq'][0] - pkt_s, 0)
-                    addstr_markup(window, y, 20, '%04d %3d %2d %s%s%s  %4d  %s%4d%s  %3d < {%3d} < %3d  %3d < {%3d} < %3d' % \
-                           (freq, mcs_index, bandwidth,
-                            '{' if active_tx else '', format_ant(ant_id), '}' if active_tx else '',
+                    addstr_markup(window, y, 20, '%s%s%s  %4d  %s%4d%s  %3d < {%3d} < %3d  %3d < {%3d} < %3d' % \
+                           ('{' if active_tx else '', format_ant(ant_id), '}' if active_tx else '',
                             1000 * pkt_s // self.log_interval,
                             '{' if diff_loss else '', 1000 * diff_loss // self.log_interval, '}' if diff_loss else '',
                             rssi_min, rssi_avg, rssi_max,
@@ -299,8 +347,39 @@ class AntennaStatClientFactory(ReconnectingClientFactory):
     def __init__(self, stdscr, profile):
         self.stdscr = stdscr
         self.profile = profile
+        self.service_list = None  # Filled on connect from server settings or local config
+        self.status_msg = None
         self.windows = {}
-        self.init_windows()
+
+    def update_service_list(self, settings_dict, server_profile=None):
+        # server_profile is None for old servers
+        if server_profile is not None and server_profile != self.profile:
+            raise Exception('Server profile is %s, but %s was requested. Check --port value.' % (server_profile, self.profile))
+
+        # Prefer settings pushed by the server - it has the actual service list.
+        # Old servers don't send them, fall back to the local config.
+        cfg_settings = settings_from_dict(settings_dict) if settings_dict is not None else settings
+
+        service_list = list((s_name, cfg.stream_rx is not None, cfg.stream_tx is not None)
+                            for s_name, _, cfg in parse_services(self.profile, None, cfg_settings))
+
+        if service_list != self.service_list:
+            self.service_list = service_list
+            self.init_windows()
+
+    def set_status(self, msg, attrs=0):
+        # Saved to be redrawn by init_windows on terminal resize
+        self.status_msg = (msg, attrs)
+
+        if self.windows:
+            for window in self.windows.values():
+                window.erase()
+                addstr_centered(window, msg, attrs)
+                window.refresh()
+        else:
+            self.stdscr.erase()
+            addstr_centered(self.stdscr, msg, attrs)
+            self.stdscr.refresh()
 
     def init_windows(self):
         self.windows.clear()
@@ -318,9 +397,14 @@ class AntennaStatClientFactory(ReconnectingClientFactory):
         curses.resize_term(height, width)
         self.stdscr.clear()
 
-        service_list = list((s_name, cfg.stream_rx is not None, cfg.stream_tx is not None) for s_name, _, cfg in  parse_services(self.profile, None))
+        if self.service_list is None:
+            # Not connected yet - service list is not known
+            if self.status_msg is not None:
+                addstr_centered(self.stdscr, *self.status_msg)
+            self.stdscr.refresh()
+            return
 
-        if not service_list:
+        if not self.service_list:
             rectangle(self.stdscr, 0, 0, height - 1, width - 1)
             addstr_noerr(self.stdscr, 0, 3, '[%s not configured]' % (self.profile,), curses.A_REVERSE)
             self.stdscr.refresh()
@@ -330,7 +414,7 @@ class AntennaStatClientFactory(ReconnectingClientFactory):
         h_exp = height
         h_fixed = 3
 
-        for _, show_rx_stats, show_tx_stats in service_list:
+        for _, show_rx_stats, show_tx_stats in self.service_list:
             if show_rx_stats or show_tx_stats:
                 n_exp += 1
             else:
@@ -342,7 +426,7 @@ class AntennaStatClientFactory(ReconnectingClientFactory):
         hoff_int = 0
         hoff_float = 0
 
-        for name, show_rx_stats, show_tx_stats in service_list:
+        for name, show_rx_stats, show_tx_stats in self.service_list:
             if show_rx_stats or show_tx_stats:
                 hoff_float += h_exp
             else:
@@ -373,21 +457,17 @@ class AntennaStatClientFactory(ReconnectingClientFactory):
             hoff_int += max(whl)
         self.stdscr.refresh()
 
+        # Restore status message (i.e. 'Waiting for data...') in the new windows
+        if self.status_msg is not None:
+            self.set_status(*self.status_msg)
+
     def startedConnecting(self, connector):
         set_window_title('Connecting to %s:%d ...' % (connector.host, connector.port))
-
-        for window in self.windows.values():
-            window.erase()
-            addstr_centered(window, 'Connecting to wifibroadcast@%s.service ...' % (self.profile,), curses.A_DIM)
-            window.refresh()
+        self.set_status('Connecting to wifibroadcast@%s.service ...' % (self.profile,), curses.A_DIM)
 
     def buildProtocol(self, addr):
         set_window_title('Connected to %s' % (addr,))
-
-        for window in self.windows.values():
-            window.erase()
-            addstr_centered(window, 'Waiting for data...', curses.A_DIM)
-            window.refresh()
+        self.set_status('Waiting for data...', curses.A_DIM)
 
         self.resetDelay()
         p = AntennaStat()
@@ -396,27 +476,19 @@ class AntennaStatClientFactory(ReconnectingClientFactory):
 
     def clientConnectionLost(self, connector, reason):
         set_window_title('Disconnected from wifibroadcast@%s.service: %s' % (self.profile, reason.value))
-
-        for window in self.windows.values():
-            window.erase()
-            addstr_centered(window, '[wifibroadcast@%s.service disconnected]' % (self.profile,), curses.A_REVERSE)
-            window.refresh()
-
+        self.set_status('[wifibroadcast@%s.service disconnected]' % (self.profile,), curses.A_REVERSE)
         ReconnectingClientFactory.clientConnectionLost(self, connector, reason)
 
     def clientConnectionFailed(self, connector, reason):
         set_window_title('Unable to connect to wifibroadcast@%s.service: %s' % (self.profile, reason.value))
-
-        for window in self.windows.values():
-            window.erase()
-            addstr_centered(window, '[wifibroadcast@%s.service failed]' % (self.profile,), curses.A_REVERSE)
-            window.refresh()
-
+        self.set_status('[wifibroadcast@%s.service failed]' % (self.profile,), curses.A_REVERSE)
         ReconnectingClientFactory.clientConnectionFailed(self, connector, reason)
 
 
-def init(stdscr, profile, host):
-    stats_port = getattr(settings, profile).stats_port
+def init(stdscr, profile, host, port):
+    if port is None:
+        port = getattr(settings, profile).stats_port
+
     f = AntennaStatClientFactory(stdscr, profile)
 
     # Resize windows on terminal size change
@@ -424,7 +496,7 @@ def init(stdscr, profile, host):
         reactor.callFromThread(lambda: defer.maybeDeferred(f.init_windows).addErrback(abort_on_crash))
 
     signal.signal(signal.SIGWINCH, sigwinch_handler)
-    reactor.connectTCP(host, stats_port, f)
+    reactor.connectTCP(host, port, f)
 
 
 
@@ -435,6 +507,7 @@ def main():
                                      formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--version', action='version', version=version_msg % settings)
     parser.add_argument('--host', type=str, default='127.0.0.1', help='WFB-ng host')
+    parser.add_argument('--port', type=int, default=None, help='WFB-ng stats port (default: stats_port from the local config)')
     parser.add_argument('profile', type=str, help='WFB-ng profile')
     args = parser.parse_args()
 
@@ -447,7 +520,7 @@ def main():
         curses.cbreak()
         curses.curs_set(0)
         stdscr.keypad(True)
-        reactor.callWhenRunning(lambda: defer.maybeDeferred(init, stdscr, args.profile, args.host)\
+        reactor.callWhenRunning(lambda: defer.maybeDeferred(init, stdscr, args.profile, args.host, args.port)\
                             .addErrback(abort_on_crash))
         reactor.run()
     finally:

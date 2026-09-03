@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# Copyright (C) 2018-2024 Vasily Evseenko <svpcom@p2ptech.org>
+# Copyright (C) 2018-2026 Vasily Evseenko <svpcom@p2ptech.org>
 
 #
 #   This program is free software; you can redistribute it and/or modify
@@ -155,7 +155,9 @@ class MavlinkARMProtocol(object):
         if (sys_id, comp_id, msg_id) != (1, 1, MAVLINK_MSG_ID_HEARTBEAT):
             return
 
-        armed = bool(message[6] & MAV_MODE_FLAG_SAFETY_ARMED)
+        # Mavlink2 truncates zero bytes at the end of the payload,
+        # so short heartbeat means that base_mode is zero (not armed).
+        armed = bool(message[6] & MAV_MODE_FLAG_SAFETY_ARMED) if len(message) > 6 else False
 
         if not self.locked:
             self.locked = True
@@ -241,7 +243,8 @@ class MavlinkTCPFactory(Factory):
         self.peer = peer
 
     def messageReceived(self, m):
-        self.peer.write(m)
+        if self.peer is not None:
+            self.peer.write(m)
 
     def write(self, data):
         for s in self.sessions:
